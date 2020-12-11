@@ -1,0 +1,315 @@
+---
+title: "ODEs and Nimble"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      cache = TRUE, 
+                      message = FALSE, 
+                      warning = FALSE, 
+                      dpi = 600)
+set.seed(0)
+```
+
+## Motivation
+
+Here we show how to fit ODE-type models to noisy data using `Nimble`. We begin with writing a `C++` function encoding the ODE system and allowing for its numerical resolution. This step is done using the package `odeintr`. Then we define a `Nimble` function to wrap the `C++` ODE solver. We start with a 1D ODE example, then move to a 4D ODE for fun. Last, we fit a model that is specified with a system of ODEs and gaussian noise.
+
+
+Let's load the packages:
+```{r}
+library(nimble)
+library(odeintr)
+library(Rcpp)
+source("odetoNimble_fun.R")
+```
+
+## 1D example
+
+Our first example is a simple logistic growth model $dy/dt= r y (1 - y/K)$. We define the system of equation then we build the `C++` code and compile it:
+```{r}
+logistic.sys = "dxdt[0] = alpha * x[0] * (1-x[0]/beta)"
+myModel <- odetoNimble("logistic", logistic.sys, pars=c("alpha","beta"))
+```
+
+Now we use the `C++`model to define a new `Nimble`function:
+```{r}
+Cmodel_logistic <- compileNimble(myModel, showCompilerOutput = TRUE)
+```
+
+Set some values:
+```{r}
+y <- 0.1 # initial value
+times <- seq(from = 0, to = 10, by = 0.01) # time sequence
+params <- c(1.5, 10) # r and K
+time_step = 0.01
+```
+
+Lets run the new function:
+```{r}
+resultat <- Cmodel_logistic(y, times, time_step,par=params)
+head(resultat)
+```
+
+We now define a `Nimble` code:
+```{r}
+demoCode <- nimbleCode({
+  init ~ dunif(0.1,0.1)
+  y[1:1001,1:2] <- myModel(c(init),times[1:1001],0.01,param[1:2])
+})
+```
+
+Build and compile le model:
+```{r}
+constants = list()
+data = list()
+inits = list(init=0.1,param=c(alpha=1.5,beta=10),times=times)
+demoModel <- nimbleModel(demoCode, constants, data, inits, check = TRUE, calculate = FALSE)
+
+CdemoModel <- compileNimble(demoModel, dirName=file.path(getwd(),"test"), showCompilerOutput = TRUE)
+
+CdemoModel$calculate()
+head(CdemoModel$y)
+```
+
+## 4D example
+
+I use data from a paper by Witkowski and Brais entitled [Bayesian Analysis of Epidemics - Zombies, Influenza, and other Diseases](https://arxiv.org/abs/1311.6376). The authors provide a Python notebook [here](https://gist.github.com/bblais/181abd99f878282666b98a29588dda41). Briefly speaking, they counted the number of living deads in several famous zombie movies. I use the data from [Shaun of the Dead](https://www.imdb.com/title/tt0365748/).
+
+The authors propose the following SIR epidemic model (more [here](https://github.com/oliviergimenez/SIRcovid19)) to capture the zombie apocalypse:
+$$
+dS/dt = - \beta S Z \\
+dE/dt = \beta S Z - \zeta E \\
+dZ/dt = \zeta E - \alpha S Z \\
+dR/dt = \alpha S Z
+$$
+Let us solve this system of ODEs. First, set up some values:
+```{r}
+y <- c(508.2, 0, 1, 0) # intial values
+times <- seq(from = 0, to = 50, by = 1) # time sequence
+params <- c(0.2, 6, 0, 508.2) # beta, zeta, alpha, Sinit
+```
+
+Write the system of ODEs:
+```{r}
+zombie.sys = '
+  dxdt[0] = -beta * x[0] * x[2] / Sinit;
+  dxdt[1] = beta * x[0] * x[2] / Sinit - zeta * x[1];
+  dxdt[2] = zeta * x[1] - alpha * x[0] * x[2];
+  dxdt[3] = alpha * x[0] * x[2];
+'
+myModel <- odetoNimble("zombie", zombie.sys, pars=c("beta","zeta","alpha","Sinit"))
+```
+
+Write the `Nimble` code:
+```{r}
+code <- nimbleCode({
+  xOde[1:51, 1:5] <- myModel(y[1:4], times[1:51],1, params[1:4])
+})
+constants <- list()
+data <- list()
+inits <- list(y = y, params = params, times=times)
+demoModel <- nimbleModel(code, constants, data, inits, check = TRUE, calculate = FALSE)
+CdemoModel <- compileNimble(demoModel, dirName=file.path(getwd(),"test"), showCompilerOutput = TRUE)
+CdemoModel$calculate()
+head(CdemoModel$xOde)
+```
+
+test avec `deSolve`:
+```{r}
+y <- c(508.2, 0, 1, 0) # intial values
+times <- seq(from = 0, to = 50, by = 1) # time sequence
+params <- c(0.2, 6, 0, 508.2) # beta, zeta, alpha, Sinit
+shaun <- function(t, y, parms){
+  dy1 <- - parms[1] * y[1] * y[3] / parms[4] # S
+  dy2 <- parms[1] * y[1] * y[3] / parms[4] - parms[2] * y[2] # E
+  dy3 <- parms[2] * y[2] - parms[3] * y[1] * y[3] # Z
+  dy4 <- parms[3] * y[1] * y[3] # R
+  return(list(c(dy1, dy2, dy3, dy4)))
+} 
+ode_nativeR <- deSolve::ode(y, times, shaun, params)[, -1]
+head(ode_nativeR)
+```
+
+Compare with native `R`:
+```{r}
+sum(CdemoModel$xOde[,-1]-ode_nativeR)
+```
+
+It works, awesome ! 
+
+## Add gaussian noise
+
+Now let us have a look to a system with some observation error, which we assume is gaussian. 
+
+First, we read in the data from *Shaun of the Dead*:
+```{r}
+tgrid <- c(0.00, 3.00, 5.00, 6.00, 8.00, 10.00, 22.00, 22.20, 22.50, 24.00, 25.50, 
+           26.00, 26.50, 27.50, 27.75, 28.50, 29.00, 29.50, 31.50) 
+zombies <- c(0, 1, 2, 2, 3, 3, 4, 6, 2, 3, 5, 12, 15, 25, 37, 25, 65, 80, 100)
+```
+
+Now the code:
+```{r}
+code <- nimbleCode({
+  
+  # system of ODEs
+  xOde[1:ngrid, 1:(ndim+1)] <- myModel(y[1:ndim], times[1:ngrid], 0.1, params[1:ndim])
+  # priors on parameters
+  params[1] ~ dunif(0, 10) # beta
+  params[2] ~ dunif(0, 1) # zeta
+  params[3] ~ dunif(0, 0.01) # alpha
+  params[4] ~ dunif(300, 600) # Sinit
+  
+  # observation error
+  for (i in 1:ngrid){
+    obs_x[i] ~ dnorm(xOde[i, 4], tau.x)
+  }
+  
+  # prior on error sd
+  tau.x <- 1 / var.x
+  var.x <- 1 / (sd.x * sd.x)
+  sd.x ~ dunif(0, 5)
+})
+```
+
+Specify the constants, data and initial values:
+```{r}
+# constants
+constants <- list(ngrid = 19, 
+                  ndim = 4)
+
+# data (pass times and y in constants?)
+data <- list(times = tgrid,
+             obs_x = zombies,
+             y = c(508.2, 0, 1, 0))
+
+# initial values
+inits <- list(sdx = 2)
+```
+
+Get ready:
+```{r}
+Rmodel <- nimbleModel(code, constants, data, inits)
+# Rmodel$calculate()   ## NA...
+conf <- configureMCMC(Rmodel)
+conf$printMonitors()
+```
+
+```{r}
+conf$printSamplers(byType = TRUE)
+```
+
+```{r}
+Rmcmc <- buildMCMC(conf)
+Cmodel <- compileNimble(Rmodel)
+Cmcmc <- compileNimble(Rmcmc, project = Rmodel)
+```
+
+Unleash the beast:
+```{r}
+samplesList <- runMCMC(Cmcmc, 5000, 
+                       nburnin = 1000,
+                       thin = 10,
+                       nchains = 2,
+                       samplesAsCodaMCMC = TRUE)
+```
+
+Check out convergence:
+```{r}
+library(coda)
+gelman.diag(samplesList)
+```
+
+Visualize traceplots and posterior distributions:
+```{r}
+library(basicMCMCplots)
+chainsPlot(samplesList)
+```
+
+Apart from the standard deviation of the observation error, the mixing is poor. This is what I had with `OpenBUGS` too, see [here](https://github.com/oliviergimenez/fitODEswithOpenBUGS/blob/master/README.md). 
+
+Can we do something about that? Hopefully yes, and this is what's great with `Nimble`, you have full control of the underlying MCMC machinery. There are useful advices on the Nimble forum [here](https://groups.google.com/forum/#!searchin/nimble-users/improve$20mixing%7Csort:date/nimble-users/pggH93kjBeE/OCj7STZWAgAJ). One reason for poor mixing is correlation in parameters. Let's have a look then. 
+```{r}
+cor(samplesList$chain1)
+cor(samplesList$chain2)
+```
+
+Seems like some parameters are slightly correlated, like $\beta$ (params[1]) and $\zeta$ (params[2]) for example. For the sake of example, let's use block sampling to try and improve mixing. 
+
+First, ask what are the samples used currently: 
+```{r}
+conf$printSamplers()
+```
+
+OK, now remove the default samplers for params[1] and params[3] and use a block random walk instead:
+```{r}
+conf$removeSamplers(c('params[1]', 'params[2]'))
+conf$printSamplers()
+conf$addSampler(target = c('params[1]', 'params[2]'),
+                type = 'RW_block')
+conf$printSamplers()
+```
+
+Now rebuild, recompile:
+```{r}
+Rmcmc <- buildMCMC(conf)
+Cmodel <- compileNimble(Rmodel)
+Cmcmc <- compileNimble(Rmcmc, project = Rmodel)
+```
+
+Now rerun:
+```{r}
+samplesList <- runMCMC(Cmcmc, 5000, 
+                       nburnin = 1000,
+                       thin = 10,
+                       nchains = 2,
+                       samplesAsCodaMCMC = TRUE)
+```
+
+Visualize traceplots and posterior distributions:
+```{r}
+chainsPlot(samplesList)
+```
+
+What if we use another sampler?
+```{r}
+Rmodel <- nimbleModel(code, constants, data, inits)
+conf <- configureMCMC(Rmodel)
+conf$printSamplers()
+conf <- configureMCMC(Rmodel, onlySlice = TRUE)
+conf$printSamplers()
+```
+
+Now rebuild, recompile:
+```{r}
+Rmcmc <- buildMCMC(conf)
+Cmodel <- compileNimble(Rmodel)
+Cmcmc <- compileNimble(Rmcmc, project = Rmodel)
+```
+
+Now rerun:
+```{r}
+samplesList <- runMCMC(Cmcmc, 2000, 
+                       nburnin = 1000,
+                       thin = 1,
+                       nchains = 2,
+                       samplesAsCodaMCMC = TRUE)
+```
+
+Visualize traceplots and posterior distributions:
+```{r}
+chainsPlot(samplesList)
+```
+
+Much slower.
+
+## R version used
+
+```{r}
+sessionInfo()
+```
+
